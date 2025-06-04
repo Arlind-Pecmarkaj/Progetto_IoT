@@ -1,204 +1,304 @@
-// ESP32 Sensor Monitoring Sketch - FIXED VERSION
+// ESP32 Sensor Monitoring Sketch - InfluDB + LED Alert 
 // Sensors: MH-Z19B (SERIAL_1), ENS160+AHT2x (I2C_1), AHT20+BMP280 (I2C_2), SPS30 (I2C_3)
 
 // Pin Definitions
-#define PIN_BUTTON 35
-#define PIN_SDA     21
-#define PIN_SCL     22
-#define RXD2        19
-#define TXD2        18
-#define LED_PIN     32
+#define PIN_SDA    21     /* Pin SDA per I2C */
+#define PIN_SCL    22     /* Pin SCL per I2C */
+#define RXD2       19     /* Pin RX per Serial2 (MH-Z19B) */
+#define TXD2       18     /* Pin TX per Serial2 (MH-Z19B) */
+#define LED_PIN    32     /* Pin per il LED di allerta qualità aria */
+
+// WiFi Credentials (REPLACE WITH YOURS!)
+#define WIFI_SSID "WIFI_SSID"
+#define WIFI_PASSWORD "WIFI_PASSWORD"
+
+// InfluxDB Configuration (REPLACE WITH YOURS)
+#define INFLUXDB_URL "INFLUXDB_URL"
+#define INFLUXDB_TOKEN "INFLUXDB_TOKEN"
+#define INFLUXDB_ORG "INFLUXDB_ORG"
+#define INFLUXDB_BUCKET "INFLUXDB_BUCKET"
+#define INFLUXDB_MEASUREMENT "INFLUXDB_MEASUREMENT"
+
+// Device Tags (REPLACE WITH YOUR ACTUALS!)
+#define DEVICE_LOCATION "LOCATION" 
+#define DEVICE_ROOM "ROOM" 
+
+// Soglie per l'allerta LED
+#define AQI_ALERT_THRESHOLD 4      // AQI >= 4 (Scarso o Peggio)
+#define PM25_ALERT_THRESHOLD 35.5f // PM2.5 > 35.5 µg/m³
 
 // Library Includes
-#include <Wire.h>
-#include <DFRobot_ENS160.h>
-#include <Adafruit_AHTX0.h>
-#include <Adafruit_BMP280.h>
-#include "sps30.h"
-#include "MHZCO2.h"
+#include <WiFi.h>             /* per protocollo wifi */
+#include <InfluxDbClient.h>   /* per libreria di comunicazione con InfluxDB */
+#include <InfluxDbCloud.h>    /* per gestire il token di sicurezza InfluxDB v2 */
+#include <Wire.h>             /* per comunicazione I2C */
+#include <DFRobot_ENS160.h>   /* per sensore ENS160 */
+#include <Adafruit_AHTX0.h>   /* per sensore AHT20 */
+#include <Adafruit_BMP280.h>  /* per sensore BMP280 */
+#include "sps30.h"            /* per sensore SPS30 */
+#include "MHZCO2.h"           /* per sensore MH-Z19B */
 
 // Sensor Objects
-MHZCO2               co2Sensor;           // SERIAL_1: MH-Z19B
-DFRobot_ENS160_I2C   ens160(&Wire, 0x53); // I2C_1:    ENS160+AHT2x  
-Adafruit_AHTX0       aht20;               // I2C_2:    AHT20+BMP280
-Adafruit_BMP280      bmp280;              // I2C_2:    AHT20+BMP280
-struct sps30_measurement sps30_meas;      // I2C_3:    SPS30
+MHZCO2               mhz19bSensor;
+DFRobot_ENS160_I2C   ens160(&Wire, 0x53);
+Adafruit_AHTX0       aht20;
+Adafruit_BMP280      bmp280;
+struct sps30_measurement sps30_data; // Struct per i dati SPS30
 
-// Variables for sensor stability
-unsigned long lastSensorRead = 0;
-bool sensorsWarmedUp = false;
+// InfluxDB Client and Point Object
+InfluxDBClient       influxClient(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN);
+Point                envDataPoint(INFLUXDB_MEASUREMENT); // Oggetto Point globale per i dati ambientali
+
+// Global variables for sensor readings
+bool    sensorsWarmedUpGeneral = false;
+float   currentTempAHT20 = -273.15f; // Gradi Celsius
+float   currentHumAHT20 = -1.0f;    // Percentuale %
+int     co2MHZ19B = 0;              // ppm
+uint16_t tvocENS160 = 0;            // ppb
+uint16_t eco2ENS160 = 0;            // ppm
+uint8_t  aqiENS160 = 0;             // Indice AQI UBA
+float   tempBMP280 = -273.15f;      // Gradi Celsius
+float   pressureBMP280 = 0.0f;      // hPa
+float   altitudeBMP280 = 0.0f;      // metri
+bool    sps30HasValidData = false;  // Flag per validità dati SPS30
+
+void connectWiFi() {
+  Serial.print("Connessione a WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int wifi_retries = 0;
+  while (WiFi.status() != WL_CONNECTED && wifi_retries < 30) {
+    delay(500);
+    Serial.print(".");
+    wifi_retries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("\nWiFi connesso! Indirizzo IP: ");
+    Serial.println(WiFi.localIP());
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov"); // Sincronizzazione NTP
+    Serial.print("In attesa della sincronizzazione dell'ora");
+    time_t now = time(nullptr);
+    while (now < 8 * 3600 * 2) {
+      delay(500);
+      Serial.print(".");
+      now = time(nullptr);
+    }
+    Serial.println("\nOra sincronizzata.");
+  } else {
+    Serial.println("\nConnessione WiFi FALLITA. Procedo senza InfluxDB.");
+  }
+}
 
 void setup() {
-  // Initialize pins
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
-  
-  // Serial communications
+  digitalWrite(LED_PIN, LOW); // LED spento all'inizio
+
   Serial.begin(115200);
   delay(1000);
   Serial.println("=== ESP32 Multi-Sensor Monitor ===");
+
+  connectWiFi();
+
+  if (WiFi.isConnected()) {
+    Serial.print("Verifica connessione InfluxDB: ");
+    if (influxClient.validateConnection()) {
+      Serial.print("Connesso a InfluxDB!");
+      // Aggiungo i tag globali all'oggetto Point
+      envDataPoint.addTag("host", "ESP"); // Uso il MAC address come ID univoco dell'host
+      envDataPoint.addTag("location", DEVICE_LOCATION);
+      envDataPoint.addTag("room", DEVICE_ROOM);
+    } else {
+      Serial.print("Connessione a InfluxDB FALLITA: ");
+      Serial.println(influxClient.getLastErrorMessage());
+    }
+  }
   
-  // Initialize I2C
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(100000); // 100kHz for better compatibility
-  
-  // Initialize Serial2 for MH-Z19B
+  Wire.setClock(100000); 
   Serial2.begin(9600, SERIAL_8N1, RXD2, TXD2);
   
-  Serial.println("\n--- Initializing Sensors ---");
+  Serial.println("\n--- Inizializzazione Sensori ---");
   
-  // 1. SERIAL_1: MH-Z19B CO2 Sensor
   Serial.print("1. MH-Z19B (SERIAL_1): ");
-  co2Sensor.begin(&Serial2);
-  delay(500);
-  Serial.println("Initialized (warming up...)");
+  mhz19bSensor.begin(&Serial2);
+  Serial.println(mhz19bSensor.getCO2() > 0 ? "Inizializzato (riscaldamento...)" : "[ERRORE] MH-Z19B non risponde");
   
-  // 2. I2C_1: ENS160+AHT2x Combined Sensor
-  Serial.print("2. ENS160+AHT2x (I2C_1): ");
-
-  int ens160BeginResult = ens160.begin(); 
-  if (ens160BeginResult != 0) {
-    Serial.print("[ERROR] ENS160 init failed "); Serial.println(ens160BeginResult);
-  } else {
-    Serial.println("Initialized");
-    // Set ENS160 to standard mode
+  Serial.print("2. ENS160 (I2C_1): ");
+  if (ens160.begin() == 0) {
+    Serial.println("Inizializzato");
     ens160.setPWRMode(ENS160_STANDARD_MODE);
-    delay(500);
+  } else {
+    Serial.println("[ERRORE] ENS160 init fallito");
   }
   
-  // 3. I2C_2: AHT20+BMP280 Combined Sensor
   Serial.print("3a. AHT20 (I2C_2): ");
-  if (!aht20.begin()) { 
-    Serial.println("[ERROR] AHT20 failed to start");
-  } else {
-    Serial.println("Initialized");
-  }
+  Serial.println(aht20.begin() ? "Inizializzato" : "[ERRORE] AHT20 init fallito");
   
   Serial.print("3b. BMP280 (I2C_2): ");
-  if (!bmp280.begin()) { 
-    Serial.println("[ERROR] BMP280 not detected");
+  if (bmp280.begin()) {
+    Serial.println("Inizializzato");
+    bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL, Adafruit_BMP280::SAMPLING_X2, Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16, Adafruit_BMP280::STANDBY_MS_1000);
   } else {
-    Serial.println("Initialized");
+    Serial.println("[ERRORE] BMP280 init fallito");
   }
   
-  // 4. I2C_3: SPS30 Particulate Matter Sensor
   Serial.print("4. SPS30 (I2C_3): ");
   sensirion_i2c_init();
-  if (sps30_probe() != 0) {
-    Serial.println("[ERROR] SPS30 not detected");
+  if (sps30_probe() == 0) {
+    Serial.println("Inizializzato");
+    if (sps30_start_measurement() != 0) Serial.println("[ERRORE] SPS30 start measurement fallito");
   } else {
-    Serial.println("Initialized");
-    sps30_start_measurement();
-    delay(1000);
+    Serial.println("[ERRORE] SPS30 init fallito");
   }
   
-  Serial.println("\n--- Setup Complete ---");
-  Serial.println("Sensors warming up for 30 seconds...\n");
-  delay(3000); // Initial delay for sensor stabilization
+  Serial.println("\n--- Setup Completato ---");
+  Serial.println("Riscaldamento sensori per circa 60 secondi (potrebbe impiegarci di più)...");
+  delay(6000); 
+}
+
+void readAllSensors() {
+  Serial.println("\n--- Lettura Sensori ---");
+
+  // AHT20 (Temperatura e Umidità)
+  sensors_event_t hum_event, temp_event;
+  bool aht20_success = aht20.getEvent(&hum_event, &temp_event);
+  if (aht20_success && temp_event.temperature > -40 && temp_event.temperature < 85 && hum_event.relative_humidity >= 0 && hum_event.relative_humidity <= 100) {
+    currentTempAHT20 = temp_event.temperature;
+    currentHumAHT20 = hum_event.relative_humidity;
+    Serial.printf("AHT20: Temp=%.2f°C, Hum=%.2f%%\n", currentTempAHT20, currentHumAHT20);
+  } else {
+    currentTempAHT20 = -273.15f; // Reset a valore non valido
+    currentHumAHT20 = -1.0f;     // Reset a valore non valido
+    Serial.println("AHT20: [Errore lettura o valori non validi]");
+  }
+
+  // MH-Z19B (CO2)
+  co2MHZ19B = mhz19bSensor.getCO2();
+  if (co2MHZ19B > 0 && co2MHZ19B < 10000) {
+    Serial.printf("MH-Z19B: CO2=%d ppm\n", co2MHZ19B);
+  } else {
+    co2MHZ19B = 0; // Reset a valore non valido/default
+    Serial.println("MH-Z19B: [Riscaldamento o errore]");
+  }
+
+  // ENS160 (eCO2, TVOC, AQI) - con compensazione da AHT20
+  if (currentTempAHT20 > -41.0f && currentHumAHT20 >= 0.0f) { // Se AHT20 ha fornito dati validi
+    ens160.setTempAndHum(currentTempAHT20, currentHumAHT20);
+     Serial.printf("ENS160: Compensazione Temp=%.1f°C, Hum=%.1f%%\n", currentTempAHT20, currentHumAHT20);
+  }
+  uint8_t ens_status = ens160.getENS160Status();
+  if (ens_status == 0) { // Status 0 (Normal), 1 (Warmup), 2 (Initial Startup)
+      eco2ENS160 = ens160.getECO2();
+      tvocENS160 = ens160.getTVOC();
+      aqiENS160 = ens160.getAQI();
+      Serial.printf("ENS160: eCO2=%d ppm, TVOC=%d ppb, AQI=%d (Status: %d)\n", eco2ENS160, tvocENS160, aqiENS160, ens_status);
+  } else if (ens_status == 1 || ens_status == 2) {
+      Serial.println("ENS160: Il sensore è in fase di riscaldamento/startup.");
+  } else { 
+      Serial.println("ENS160: Errore lettura status o sensore non pronto.");
+      eco2ENS160 = 0; tvocENS160 = 0; aqiENS160 = 0;
+  }
+
+  // BMP280 (Temperatura, Pressione, Altitudine)
+  tempBMP280 = bmp280.readTemperature();
+  pressureBMP280 = bmp280.readPressure() / 100.0F; // Converti Pa a hPa
+  if (tempBMP280 > -40 && tempBMP280 < 85 && pressureBMP280 > 300 && pressureBMP280 < 1100) {
+    Serial.printf("BMP280: Temp=%.2f°C, Press=%.2f hPa\n", tempBMP280, pressureBMP280);
+  } else {
+    tempBMP280 = -273.15f; pressureBMP280 = 0; // Reset
+    Serial.println("BMP280: [Errore lettura o valori non validi]");
+  }
+
+  // SPS30 (Particolato)
+  uint16_t sps_data_ready;
+  sps30HasValidData = false;
+  if (sps30_read_data_ready(&sps_data_ready) == 0 && sps_data_ready) {
+    if (sps30_read_measurement(&sps30_data) == 0) {
+      sps30HasValidData = true;
+      Serial.printf("SPS30: PM2.5=%.2f µg/m³, PM10=%.2f µg/m³\n", sps30_data.mc_2p5, sps30_data.mc_10p0);
+      // Potresti stampare altri valori SPS30 se necessario
+    } else {
+      Serial.println("SPS30: Errore lettura misurazione");
+    }
+  } else {
+    Serial.println("SPS30: Dati non pronti o errore flag");
+  }
+}
+
+void processSensorAlerts() {
+  bool alert = false;
+  if (aqiENS160 >= AQI_ALERT_THRESHOLD) {
+    alert = true;
+    Serial.println("ALLERTA: AQI elevato!");
+  }
+  if (sps30HasValidData && sps30_data.mc_2p5 > PM25_ALERT_THRESHOLD) {
+    alert = true;
+    Serial.println("ALLERTA: PM2.5 elevato!");
+  }
+  digitalWrite(LED_PIN, alert);
+}
+
+void writeToInfluxDB() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi non connesso. Questa serie di dati non verrà inviata a InfluxDB.");
+    connectWiFi(); 
+    return;
+  }
+
+  envDataPoint.clearFields(); // Pulisco i campi precedenti
+
+  // Aggiungo solo i campi con valori validi/sensati
+  if (currentTempAHT20 > -41.0f) envDataPoint.addField("temperature_aht20", currentTempAHT20);
+  if (currentHumAHT20 >= 0.0f) envDataPoint.addField("humidity_aht20", currentHumAHT20);
+  if (co2MHZ19B > 0) envDataPoint.addField("co2_mhz19b", co2MHZ19B);
+  
+  if (eco2ENS160 > 0 ) envDataPoint.addField("eco2_ens160", eco2ENS160); // ENS160 può dare 0 durante il riscaldamento iniziale
+  if (tvocENS160 >= 0 ) envDataPoint.addField("tvoc_ens160", tvocENS160); // TVOC può essere 0
+  if (aqiENS160 > 0 ) envDataPoint.addField("aqi_ens160", (int)aqiENS160);
+  if (currentTempAHT20 > -41.0f && currentHumAHT20 >= 0.0f) { // Log compensazione se usata
+      envDataPoint.addField("comp_temp_ens160", currentTempAHT20);
+      envDataPoint.addField("comp_hum_ens160", currentHumAHT20);
+  }
+
+  if (tempBMP280 > -41.0f) envDataPoint.addField("temperature_bmp280", tempBMP280);
+  if (pressureBMP280 > 300) envDataPoint.addField("pressure_bmp280", pressureBMP280);
+  if (altitudeBMP280 != 0 || pressureBMP280 > 300) envDataPoint.addField("altitude_bmp280", altitudeBMP280); // Altitudine può essere 0
+
+  if (sps30HasValidData) {
+    envDataPoint.addField("pm1p0_sps30", sps30_data.mc_1p0);
+    envDataPoint.addField("pm2p5_sps30", sps30_data.mc_2p5);
+    envDataPoint.addField("pm4p0_sps30", sps30_data.mc_4p0);
+    envDataPoint.addField("pm10p0_sps30", sps30_data.mc_10p0);
+    envDataPoint.addField("typical_particle_size_sps30", sps30_data.typical_particle_size);
+  }
+
+  if (!envDataPoint.hasFields()) {
+      Serial.println("Nessun dato valido da inviare a InfluxDB.");
+      return;
+  }
+
+  Serial.print("Scrittura su InfluxDB: ");
+  Serial.println(envDataPoint.toLineProtocol());
+  if (!influxClient.writePoint(envDataPoint)) {
+    Serial.print("Scrittura InfluxDB FALLITA: ");
+    Serial.println(influxClient.getLastErrorMessage());
+  } else {
+    Serial.println("Scrittura InfluxDB RIUSCITA!");
+  }
 }
 
 void loop() {
-  // Button and LED control
-  bool buttonPressed = (digitalRead(PIN_BUTTON) == LOW);
-  digitalWrite(LED_PIN, buttonPressed);
-  
-  // Check if sensors have warmed up (30 seconds)
-  if (millis() > 30000) {
-    sensorsWarmedUp = true;
+  if (!sensorsWarmedUpGeneral && millis() > 60000) { // Riscaldamento generale di 60s
+    sensorsWarmedUpGeneral = true;
+    Serial.println("--- Riscaldamento generale sensori (60s) completato ---");
   }
   
-  // Timestamp
-  Serial.print("=== Timestamp: ");
-  Serial.print(millis());
-  if (!sensorsWarmedUp) {
-    Serial.print(" (warming up...)");
-  }
-  Serial.println(" ===\n");
-  
-  // 1. SERIAL_1: MH-Z19B CO2 Sensor
-  Serial.println("1. MH-Z19B CO2 Sensor (SERIAL_1):");
-  int co2ppm = co2Sensor.getCO2();
-  if (co2ppm > 0) {
-    Serial.print("   CO2: "); Serial.print(co2ppm); Serial.println(" ppm");
-  } else {
-    Serial.println("   CO2: [Warming up or error]");
-  }
-  Serial.println();
-  
-  // 2. I2C_1: ENS160+AHT2x Combined Sensor
-  Serial.println("2. ENS160+AHT2x Combined Sensor (I2C_1):");
-  uint8_t ens_status = ens160.getENS160Status();
-  if (ens_status == 0) {
-    uint16_t tvoc = ens160.getTVOC();
-    uint16_t eco2 = ens160.getECO2();
-    uint8_t aqi = ens160.getAQI();
-    
-    Serial.print("   eCO2: "); Serial.print(eco2); Serial.println(" ppm");
-    Serial.print("   TVOC: "); Serial.print(tvoc); Serial.println(" ppb");
-    Serial.print("   AQI: "); Serial.println(aqi);
-    // NOTA: Aggiungere la temperatura e umidità relativa.
-  } else {
-    Serial.println("   ENS160: [Not ready or error]");
-  }
-  Serial.println();
-  
-  // 3. I2C_2: AHT20+BMP280 Combined Sensor
-  Serial.println("3. AHT20+BMP280 Combined Sensor (I2C_2):");
-  
-  // AHT20 readings
-  sensors_event_t humidity, temp;
-  if (aht20.getEvent(&humidity, &temp)) {
-    if (temp.temperature > -40 && temp.temperature < 55) { // Valid range check
-      Serial.print("   AHT20 Temperature: "); Serial.print(temp.temperature); Serial.println(" °C");
-      Serial.print("   AHT20 Humidity: "); Serial.print(humidity.relative_humidity); Serial.println(" %");
-    } else {
-      Serial.println("   AHT20: [Invalid reading - check connections]");
-    }
-  } else {
-    Serial.println("   AHT20: [Read error]");
-  }
-  
-  // BMP280 readings
-  float bmpTemp = bmp280.readTemperature();
-  float bmpPressure = bmp280.readPressure();
-  float bmpAltitude = bmp280.readAltitude(1013.25); // Sea level pressure
-  
-  if (bmpTemp > -40 && bmpTemp < 55) { // Valid range check
-    Serial.print("   BMP280 Temperature: "); Serial.print(bmpTemp); Serial.println(" °C");
-    Serial.print("   BMP280 Pressure: "); Serial.print(bmpPressure / 100.0F); Serial.println(" hPa");
-    Serial.print("   BMP280 Altitude: "); Serial.print(bmpAltitude); Serial.println(" m");
-  } else {
-    Serial.println("   BMP280: [Invalid reading - check connections]");
-  }
-  Serial.println();
-  
-  // 4. I2C_3: SPS30 Particulate Matter Sensor
-  Serial.println("4. SPS30 Particulate Matter Sensor (I2C_3):");
-  uint16_t ready;
-  if (sps30_read_data_ready(&ready) == 0 && ready) {
-    if (sps30_read_measurement(&sps30_meas) == 0) {
-      // Mass Concentrations (μg/m³)
-      Serial.print("   PM1.0: "); Serial.print(sps30_meas.mc_1p0); Serial.println(" u/m³");
-      Serial.print("   PM2.5: "); Serial.print(sps30_meas.mc_2p5); Serial.println(" ug/m³");
-      Serial.print("   PM4.0: "); Serial.print(sps30_meas.mc_4p0); Serial.println(" ug/m³");
-      Serial.print("   PM10: "); Serial.print(sps30_meas.mc_10p0); Serial.println(" ug/m³");
-      
-      // Number Concentrations (#/cm³)
-      Serial.print("   NC0.5: "); Serial.print(sps30_meas.nc_0p5); Serial.println(" 1/cm³");
-      Serial.print("   NC1.0: "); Serial.print(sps30_meas.nc_1p0); Serial.println(" 1/cm³");
-      Serial.print("   NC2.5: "); Serial.print(sps30_meas.nc_2p5); Serial.println(" 1/cm³");
-      Serial.print("   NC4.0: "); Serial.print(sps30_meas.nc_4p0); Serial.println(" 1/cm³");
-      Serial.print("   NC10: "); Serial.print(sps30_meas.nc_10p0); Serial.println(" 1/cm³");
-      
-      // Typical Particle Size
-      Serial.print("   Typical Size: "); Serial.print(sps30_meas.typical_particle_size); Serial.println(" μm");
-    } else {
-      Serial.println("   SPS30: [Read error]");
-    }
-  } else {
-    Serial.println("   SPS30: [Data not ready]");
-  }
+  Serial.print("=== Timestamp Loop: "); Serial.print(millis()); Serial.println(" ===");
+
+  readAllSensors();
+  processSensorAlerts();
+  writeToInfluxDB();
   
   Serial.println("\n" + String('=', 50) + "\n");
-  delay(5000); // 5 second delay between readings
+  delay(15000); // Pausa di 15 secondi tra i cicli di lettura/invio
 }
