@@ -41,7 +41,8 @@
 
 // -- Soglie per gli Allarmi --
 #define AQI_ALERT_THRESHOLD 4      // Allarme se AQI è >= 4 (Qualità scarsa o peggio)
-#define PM25_ALERT_THRESHOLD 35.5f // Allarme se PM2.5 supera questo valore (µg/m³)
+#define PM25_ALERT_THRESHOLD 25f // Allarme se PM2.5 supera questo valore (µg/m³)
+#define PM10_ALERT_THRESHOLD 50f // Allarme se PM10 supera questo valore (µg/m³)
 
 // -- Inclusione Librerie --
 #include <WiFi.h>
@@ -312,7 +313,7 @@ void processSensorAlerts() {
         alertState = true;
         Serial.print("Allerta AQI! ");
     }
-    if (sps30HasValidData && sps30_data.mc_2p5 > PM25_ALERT_THRESHOLD) {
+    if (sps30HasValidData && sps30_data.mc_2p5 > PM25_ALERT_THRESHOLD && sps30_data.mc_10p0 >PM10_ALERT_THRESHOLD) {
         alertState = true;
         Serial.print("Allerta PM2.5! ");
     }
